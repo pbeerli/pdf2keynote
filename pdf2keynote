@@ -1,0 +1,111 @@
+#!/usr/bin/osascript -l JavaScript
+// pdf2keynote: convert a PDF (e.g. a LaTeX/Beamer talk) into a Keynote
+// presentation, one PDF page per slide, placed full-bleed as a vector image.
+// Needs only macOS and Keynote (uses PDFKit through the JXA ObjC bridge).
+//
+// usage: pdf2keynote input.pdf [-o output.key] [--width 1920]
+//
+// Copyright (c) 2026 Peter Beerli. MIT License, see LICENSE.
+// https://github.com/pbeerli/pdf2keynote
+
+ObjC.import('Foundation');
+ObjC.import('PDFKit');
+ObjC.import('stdlib');   // $.exit
+
+const USAGE = 'usage: pdf2keynote input.pdf [-o output.key] [--width 1920]\n' +
+  '  -o, --output   Keynote file to write (default: input name with .key)\n' +
+  '  --width        slide width in points; height follows the PDF aspect (default 1920)\n';
+
+function fail(msg) {
+  const err = $.NSFileHandle.fileHandleWithStandardError;
+  err.writeData($(`pdf2keynote: ${msg}\n`).dataUsingEncoding($.NSUTF8StringEncoding));
+  $.exit(1);
+}
+
+function absPath(p) {
+  const s = $(p).stringByExpandingTildeInPath.js;
+  return s.startsWith('/') ? s : `${$.NSFileManager.defaultManager.currentDirectoryPath.js}/${s}`;
+}
+
+function parseArgs(argv) {
+  const opts = { input: null, output: null, width: 1920 };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '-h' || a === '--help') { console.log(USAGE); $.exit(0); }
+    else if (a === '-o' || a === '--output') opts.output = argv[++i];
+    else if (a === '--width') opts.width = parseFloat(argv[++i]);
+    else if (a.startsWith('-')) fail(`unknown option ${a}\n${USAGE}`);
+    else if (!opts.input) opts.input = a;
+    else fail(`unexpected argument ${a}\n${USAGE}`);
+  }
+  if (!opts.input) fail(USAGE);
+  if (!(opts.width > 0)) fail('--width must be a positive number');
+  opts.input = absPath(opts.input);
+  opts.output = absPath(opts.output || opts.input.replace(/\.pdf$/i, '') + '.key');
+  return opts;
+}
+
+// write each page as its own one-page PDF into a temporary folder
+function splitPages(pdf, dir) {
+  const files = [];
+  for (let i = 0; i < pdf.pageCount; i++) {
+    const one = $.PDFDocument.alloc.init;
+    one.insertPageAtIndex(pdf.pageAtIndex(i).copy, 0);
+    const f = `${dir}/page-${String(i + 1).padStart(4, '0')}.pdf`;
+    if (!one.writeToFile($(f))) fail(`could not write ${f}`);
+    files.push(f);
+  }
+  return files;
+}
+
+function run(argv) {
+  const opts = parseArgs(argv);
+  const fm = $.NSFileManager.defaultManager;
+  if (!fm.fileExistsAtPath($(opts.input))) fail(`no such file: ${opts.input}`);
+  const pdf = $.PDFDocument.alloc.initWithURL($.NSURL.fileURLWithPath($(opts.input)));
+  if (pdf.isNil() || pdf.pageCount === 0) fail(`not a readable PDF: ${opts.input}`);
+
+  // slide size from the first page's crop box (what a viewer shows)
+  const box = pdf.pageAtIndex(0).boundsForBox($.kPDFDisplayBoxCropBox);
+  const W = Math.round(opts.width);
+  const H = Math.round(opts.width * box.size.height / box.size.width);
+
+  const tmp = `${$.NSTemporaryDirectory().js}pdf2keynote-${$.NSUUID.UUID.UUIDString.js}`;
+  fm.createDirectoryAtPathWithIntermediateDirectoriesAttributesError($(tmp), true, $(), $());
+  const pages = splitPages(pdf, tmp);
+
+  const keynote = Application('Keynote');
+  const doc = keynote.Document({ width: W, height: H });
+  keynote.documents.push(doc);
+  const layouts = doc.slideLayouts.name();
+  const blank = doc.slideLayouts[Math.max(layouts.indexOf('Blank'), 0)];
+
+  const first = doc.slides[0];               // Keynote starts every document with one slide
+  const err = $.NSFileHandle.fileHandleWithStandardError;
+  pages.forEach((f, i) => {
+    err.writeData($(`\rpdf2keynote: slide ${i + 1}/${pages.length}`).dataUsingEncoding($.NSUTF8StringEncoding));
+    const slide = keynote.Slide({ baseLayout: blank });
+    doc.slides.push(slide);
+    const s = doc.slides[doc.slides.length - 1];
+    const img = keynote.Image({ file: Path(f) });
+    s.images.push(img);
+    const im = s.images[s.images.length - 1];
+    // fit the page into the slide keeping its aspect (pages of a talk usually
+    // all match the first page; others are scaled to fit and centred)
+    const b = pdf.pageAtIndex(i).boundsForBox($.kPDFDisplayBoxCropBox).size;
+    const scale = Math.min(W / b.width, H / b.height);
+    const w = Math.round(b.width * scale), h = Math.round(b.height * scale);
+    im.width = w; im.height = h;
+    im.position = { x: Math.round((W - w) / 2), y: Math.round((H - h) / 2) };
+    // the page's text as the image description, so VoiceOver can read the slide
+    const text = pdf.pageAtIndex(i).string;
+    if (!text.isNil() && text.length > 0) im.description = text.js.replace(/\s+/g, ' ').trim();
+  });
+  err.writeData($('\n').dataUsingEncoding($.NSUTF8StringEncoding));
+  first.delete();
+
+  doc.save({ in: Path(opts.output) });
+  doc.close({ saving: 'no' });
+  fm.removeItemAtPathError($(tmp), $());
+  console.log(`pdf2keynote: ${pages.length} slides (${W}x${H}) -> ${opts.output}`);
+}
